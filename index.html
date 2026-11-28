@@ -238,8 +238,66 @@
     { id: 'o_low', tier: 3, name: 'Low Orbit', goal: 'Reach orbit with the perigee above 150 km.', check: function (s) { return s.orbit && s.bestPe >= 150000; } },
     { id: 'o_heavy', tier: 3, name: 'Heavy Lift', goal: 'Put at least 5 t of payload in orbit above 150 km.', check: function (s) { return s.orbit && s.bestPe >= 150000 && s.payload >= 5000; } },
     { id: 'o_high', tier: 3, name: 'High Orbit', goal: 'Perigee above 750 km. Lighten the payload and set the orbit target near 800 km.', check: function (s) { return s.orbit && s.bestPe >= 750000; } },
+    { id: 'o_iss', tier: 3, name: 'Match the ISS', goal: 'Reach orbit with perigee and apogee both within 25 km of the International Space Station, using its live altitude.', check: function (s) { var k = knownSat('ISS'); return !!k && s.orbit && Math.abs(s.bestPe - k.pe) <= 25000 && s.apogee <= k.ap + 25000; } },
+    { id: 'o_hubble', tier: 3, name: 'Hubble Shell', goal: 'Reach orbit with the perigee at or above the Hubble Space Telescope, using its live altitude.', check: function (s) { var k = knownSat('Hubble'); return !!k && s.orbit && s.bestPe >= k.pe - 5000; } },
     { id: 'o_clean', tier: 3, name: 'Clean Up', goal: 'Reach orbit, then burn retrograde until the perigee drops under 60 km so the stage reenters.', check: function (s) { return s.orbit && s.deorbited; } }
   ];
+  // ---------------- known satellites, live orbits from CelesTrak via Pajamastan Space Administration ----------------
+  var KNOWN = [];
+  var KNOWN_PICK = [
+    { key: 'ISS', group: 'stations', id: '25544', color: '#1e6fd9' },
+    { key: 'Tiangong', group: 'stations', id: '48274', color: '#2e7d4f' },
+    { key: 'Hubble', group: 'science', id: '20580', color: '#7b4fd8' },
+    { key: 'GPS', group: 'gps-ops', id: null, color: '#0f8fb0' }
+  ];
+  function knownSat(key) { for (var i = 0; i < KNOWN.length; i++) if (KNOWN[i].key === key) return KNOWN[i]; return null; }
+  function tleOrbit(key, color, l1, l2) {
+    var mm = parseFloat(l2.slice(52, 63)), e = parseFloat('0.' + l2.slice(26, 33).trim());
+    if (!(mm > 0)) return null;
+    var n = mm * 2 * Math.PI / 86400, a = Math.cbrt(MU / (n * n));
+    var yy = +l1.slice(18, 20), doy = parseFloat(l1.slice(20, 32));
+    var epoch = Date.UTC(yy < 57 ? 2000 + yy : 1900 + yy, 0, 1) + (doy - 1) * 86400000;
+    return { key: key, color: color, a: a, e: e, pe: a * (1 - e) - RE, ap: a * (1 + e) - RE, n: n,
+      M0: parseFloat(l2.slice(43, 51)) * Math.PI / 180, w: parseFloat(l2.slice(34, 42)) * Math.PI / 180, epoch: epoch };
+  }
+  function knownPhase(k) { return k.w + k.M0 + k.n * (Date.now() - k.epoch) / 1000; }
+  function loadKnown() {
+    var groups = {};
+    KNOWN_PICK.forEach(function (p) { groups[p.group] = 1; });
+    var found = {};
+    Promise.all(Object.keys(groups).map(function (g) {
+      return fetch('https://pajamastan-space-administration.vercel.app/api/pajamastan-space-administration-v1-tle?group=' + g)
+        .then(function (r) { if (!r.ok) throw 0; return r.text(); })
+        .then(function (t) {
+          var L = t.split(/\r?\n/);
+          for (var i = 0; i + 2 < L.length; i++) {
+            if (L[i + 1].indexOf('1 ') !== 0 || L[i + 2].indexOf('2 ') !== 0) continue;
+            var id = L[i + 1].slice(2, 7).trim();
+            KNOWN_PICK.forEach(function (p) {
+              if (p.group === g && !found[p.key] && (p.id ? p.id === id : /NAVSTAR/.test(L[i]))) found[p.key] = tleOrbit(p.key, p.color, L[i + 1], L[i + 2]);
+            });
+            i += 2;
+          }
+        }).catch(function () {});
+    })).then(function () {
+      var missing = KNOWN_PICK.filter(function (p) { return !found[p.key]; });
+      return Promise.all(missing.map(function (p) {
+        return fetch('https://tle.ivanstanojevic.me/api/tle/' + (p.id || '43873'))
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (m) { if (m && m.line1) found[p.key] = tleOrbit(p.key, p.color, m.line1, m.line2); })
+          .catch(function () {});
+      }));
+    }).then(function () {
+      var list = [];
+      KNOWN_PICK.forEach(function (p) { if (found[p.key]) list.push(found[p.key]); });
+      var geoA = Math.cbrt(MU * Math.pow(86164.0905 / (2 * Math.PI), 2));
+      list.push({ key: 'Geostationary', color: '#5a7499', a: geoA, e: 0, pe: geoA - RE, ap: geoA - RE, n: 2 * Math.PI / 86164.0905, M0: 0, w: 0, epoch: Date.now(), ring: true });
+      KNOWN = list;
+    });
+  }
+  loadKnown();
+  setInterval(loadKnown, 7200000);
+
   var UNLOCK = { 2: { tier: 1, need: 2 }, 3: { tier: 2, need: 3 } };
 
   // ---------------- state ----------------
@@ -966,6 +1024,17 @@
       function PX(X) { return cxm + X * sc; } function PY(Y) { return cym - Y * sc; }
       cx.strokeStyle = '#9db8db'; cx.lineWidth = 1; cx.beginPath(); cx.arc(cxm, cym, RE * sc, 0, Math.PI * 2); cx.stroke();
       cx.strokeStyle = '#eaf0f8'; cx.beginPath(); cx.arc(cxm, cym, (RE + 100000) * sc, 0, Math.PI * 2); cx.stroke();
+      KNOWN.forEach(function (k) {
+        var rr = k.a; if (rr * sc > Math.min(W, H) * 0.75) return;
+        cx.strokeStyle = k.color; cx.globalAlpha = 0.35; cx.setLineDash([1, 3]);
+        cx.beginPath(); cx.arc(cxm, cym, rr * sc, 0, Math.PI * 2); cx.stroke(); cx.setLineDash([]); cx.globalAlpha = 1;
+        if (!k.ring) {
+          var th = knownPhase(k), r2 = k.a * (1 - k.e * k.e) / (1 + k.e * Math.cos(th - k.w));
+          var kx = PX(r2 * Math.cos(th)), ky = PY(r2 * Math.sin(th));
+          cx.fillStyle = k.color; cx.beginPath(); cx.arc(kx, ky, 2.5, 0, Math.PI * 2); cx.fill();
+          cx.fillText(k.key, kx + 4, ky - 3);
+        } else { cx.fillStyle = k.color; cx.fillText('GEO', PX(0) + 3, PY(rr) - 2); }
+      });
       if (cn) { cx.strokeStyle = '#d9541e'; cx.setLineDash([3, 3]); cx.beginPath(); cx.moveTo(PX(cn[0]), PY(cn[1])); for (i = 2; i < cn.length; i += 2) cx.lineTo(PX(cn[i]), PY(cn[i + 1])); cx.stroke(); cx.setLineDash([]); }
       sim.bodies.forEach(function (b) {
         var t = b.traj; if (t.length < 2) return;
@@ -1019,6 +1088,11 @@
       'ALT <b>' + fmtAlt(b.y) + '</b>  APO ' + fmtAlt(s.apogee || 0)
     ];
     if (o && (b.y > 40000 || s.orbit)) lines.push('AP <b>' + (isFinite(o.ap) ? fmtAlt(o.ap) : 'escape') + '</b>  PE <b>' + fmtAlt(o.pe) + '</b>');
+    if (b.y > 100000) {
+      var near = null, gap = Infinity;
+      KNOWN.forEach(function (k) { var d = Math.abs((k.pe + k.ap) / 2 - b.y); if (d < gap) { gap = d; near = k; } });
+      if (near) lines.push('NEAR <b style="color:' + near.color + '">' + near.key + '</b> ' + fmtAlt((near.pe + near.ap) / 2) + ' (' + (b.y > (near.pe + near.ap) / 2 ? '+' : '-') + fmtAlt(gap) + ')');
+    }
     lines.push(
       'VEL <b>' + ((b.y > 80000 ? T.vabs : T.V) || 0).toFixed(0) + ' m/s</b>  MACH ' + (T.rho > 1e-7 ? (T.M || 0).toFixed(2) : '-'),
       'Q <b>' + fmtKpa(T.q || 0) + ' kPa</b>  MAX ' + fmtKpa(s.maxQ || 0),
